@@ -1,14 +1,12 @@
-import os
-
 # Added typing for clarity and mypy friendliness
-from typing import Dict, List, Optional, Set, Tuple, TypedDict
+from typing import Dict, List, Optional, Set, Tuple, TypedDict, Union
 
 from ortools.sat.python import cp_model
-from ortools.sat.python.cp_model import IntVar
+from ortools.sat.python.cp_model import IntVar, LinearExpr
 
-penalty_terms = []
+ 
 
-# Subjects preferred to be taught by specialists are provided via input JSON
+
 
 #they make everything safer, clearer, and easier to run at scale. 
 # they catch mistakes before the solver, let you swap datasets freely,
@@ -28,8 +26,7 @@ class ClassDict(TypedDict):
 class TeacherDict(TypedDict):
     id: str
     quals: Set[str]
-    unavailable: Set[Tuple[int, int]]
-    preferred: Set[Tuple[int, int]]
+    unavailable: List[Tuple[int, int]]
     weekly_max: int
 
 
@@ -50,8 +47,8 @@ class ProblemDataDict(TypedDict):
     courses: List[CourseDict]
     # subjects that should prefer qualified teachers; empty/omitted means none
     specialist_subjects: Optional[List[str]]
-    # room types considered "specials" for double-period preference
-    special_room_types: Optional[List[str]]
+    # subjects that should prefer double periods
+    double_subjects: Optional[List[str]]
     # subjects considered "difficult" to cluster all on one day
     difficult_day_subjects: Optional[List[str]]
     # special per weekday maximum lessons (e.g., “Fridays ≤5”).
@@ -69,43 +66,40 @@ class SolutionDict(TypedDict, total=False):
     #"T_A": { "Mon": ["C1-Math@R101", "C1-German@R101", "-", "C1-PE@Gym", "-", "-"]
     stats: Dict[str, float]#  "stats": {"conflicts": 1234, "branches": 5678, "wall_time_s": 2.7},
     penalties: Dict[str, Dict[str, float]]# "penalties": { "unavailability": {"weight": 5, "count": 1, "weighted": 5},"double_period_singles": {"weight": 2, "count": 2, "weighted": 4},"total_weighted": {"weight": 1, "count": 0, "weighted": 12}
-  
-
-
+    num_slots_per_day: int
+    run_config: Dict[str, Optional[Union[int, float]]]
 def solve_timetabling_problem(
     problem_data: ProblemDataDict,
     *,
-    off_preference_weight: int = 2,
     # Soft penalty for assigning a teacher at a marked-unavailable slot
     unavailability_weight: int = 5,
     # Soft penalty for assigning an unqualified teacher (for specialist subjects)
     unqualified_weight: int = 3,
-    time_limit_seconds: float = 10.0,#The solver keeps searching for a better schedule until time runs out.
+    time_limit_seconds: float = 20.0,#The solver keeps searching for a better schedule until time runs out.
     random_seed: Optional[int] = None,#Seed = repeatable random choices.
-    #Many threads = order can change ⇒ results can change, even with the same seed.
-    num_search_workers: Optional[int] = None,#None is the default value. If the caller doesn’t pass anything, the value inside the function will be None.
-    triple_difficult_weight: int = 2,#Penalty for scheduling Math + English + Science on the same day
+    triple_difficult_weight: int = 2,#Penalty per period above the difficult-subject threshold per day
     # Soft penalty for specials that are not in double periods
     double_period_weight: int = 2,
-    # Soft penalty for headteacher covering less than ~70% of class periods
-    headteacher_quota_weight: int = 2,
+    # Soft penalty for exceeding per-subject daily cap (>2 per day per class)
+    subject_daily_cap_weight: int = 2,
 ) -> SolutionDict:#The function returns a dictionary
 
     """Solve the school timetabling CP-SAT model.
 
- Hard constraints (must hold):
+    Hard constraints (must hold):
       • Each course scheduled exactly for its required periods.
       • No overlaps for classes, teachers, or rooms.
       • Per-class daily min/max bounds (plus optional per-day overrides).
-      • Each class’s lessons per day form one contiguous block.
+      • Each class's lessons per day form one contiguous block.
       • First slot occupied each day (current setting).
 
     Soft constraints (penalized in objective):
       • Teacher assigned during an unavailable slot.
       • Unqualified teacher on specialist subjects (from input specialist_subjects).
-      • Specialist classes not placed as double periods.
-      • “Triple difficult” day (Math+English+Science on same day).
-      • Teacher preference shortfall (quota model).
+      • Double subjects not placed as double periods.
+      • More than 3 difficult subjects in a day for a class (penalize excess).
+      • Subject appears more than twice in a day for a class (penalize excess).
+      
 
     Returns:
     - A dictionary with status, objective value (if minimized), and timetables
@@ -114,18 +108,30 @@ def solve_timetabling_problem(
     # Config from input (or empty defaults)
     specialist_list: List[str] = list(problem_data.get("specialist_subjects") or [])
     specialist_set: Set[str] = set(specialist_list)
-    special_room_types: Set[str] = set(problem_data.get("special_room_types") or [])
+    double_subjects: Set[str] = set(problem_data.get("double_subjects") or [])
     difficult_subjects: List[str] = list(problem_data.get("difficult_day_subjects") or [])
+    # Fixed threshold: combined difficult-subject periods per day must be <= 3 (no penalty),
+    # penalty triggers when total > 3
+    difficult_threshold: int = 3
 #the endpoint receives the JSON, and problem_data/problem_data_dict holds those values for the solver to use.
 #Those lines are just taking things out of the box so the solver can use them.
 #ProblemDataDict is just a schema/checklist: 
 # it helps catch missing fields early (e.g., you forgot courses) and makes the code clearer.
+#Taking pieces out of that JSON
+
+#Putting them into variables with clear names
+
+#Preparing fast lookup structures for later constraints
     days: List[str] = problem_data["days"] 
     num_slots_per_day: int = problem_data["num_slots_per_day"]
     slots: List[int] = list(range(num_slots_per_day))
     rooms: List[RoomDict] = problem_data["rooms"]
     classes: List[ClassDict] = problem_data["classes"]
     teachers: List[TeacherDict] = problem_data["teachers"]
+    teacher_unavailable_sets: List[Set[Tuple[int, int]]] = [
+        {tuple(pair) for pair in t["unavailable"]}
+        for t in teachers
+    ]
     courses: List[CourseDict] = problem_data["courses"]
     per_day_max_map: Dict[str, int] = problem_data.get("per_day_max") or {}
 
@@ -133,9 +139,6 @@ def solve_timetabling_problem(
     # Quick lookup maps: translate human IDs ("C1", "Gym") to compact integers (0,1,2…)
 # This makes it easy and fast to loop over classes/rooms and build arrays of variables.
     class_index = {c["id"]: i for i, c in enumerate(classes)} # e.g., {"C1": 0, "C2": 1, ...}
-    room_id_index = {r["id"]: i for i, r in enumerate(rooms)}  # e.g., {"R101": 0, "Gym": 1, ...}
-    teacher_id_index = {t["id"]: i for i, t in enumerate(teachers)}#
-
     model = cp_model.CpModel()#CpModel() is the container that holds your whole math problem
 
     # Decision variables
@@ -279,117 +282,6 @@ def solve_timetabling_problem(
         if weekly_vars:
             model.Add(sum(weekly_vars) <= t["weekly_max"])
 
-    penalty_terms: List[PenaltyExpr] = []
-    # Track components for detailed breakdown
-    off_pref_vars: List[IntVar] = []  # counts preference shortfall per teacher
-    unavailability_vars: List[IntVar] = []
-    unqualified_vars: List[IntVar] = []
-    headteacher_shortfall_vars: List[IntVar] = []
-
-    # Headteacher ~70% soft quota per class
-    for cls_idx, cls in enumerate(classes):#{"id":"C1", ...}).
-        head_id = cls.get("headteacher_id") if isinstance(cls, dict) else None
-        if not head_id or head_id not in teacher_id_index:
-            continue
-        head_t_idx = teacher_id_index[head_id]#Turn the headteacher’s string ID (e.g. "T_A") into a small integer index (e.g. 0).
-#Count how many lessons this class has in total (sum of all its courses’ periods). If zero, skip.
-        total_periods = sum(course["periods"] for course in courses if course["class_id"] == cls["id"])  
-        if total_periods <= 0:
-            continue
-        #Collect all the 0/1 variables that would be 1 exactly when the headteacher teaches one of this class’s lessons at some (day, slot).
-        head_assign_vars: List[IntVar] = [
-            teacher_assigned[(c_idx, d, s, head_t_idx)]
-            for c_idx, course in enumerate(courses)
-            if course["class_id"] == cls["id"]
-            for d in range(len(days))
-            for s in slots
-            if (c_idx, d, s, head_t_idx) in teacher_assigned
-        ]
-        #Create an integer variable that will equal “how many periods the headteacher teaches” (between 0 and total_periods).
-        head_count = model.NewIntVar(0, total_periods, f"headteach_count_cls{cls_idx}")
-        if head_assign_vars:
-            model.Add(head_count == sum(head_assign_vars))
-        else:
-            model.Add(head_count == 0)
-        target = int(0.7 * total_periods)
-        #z is (target – actual).
-#If head_count = 12 and target = 14 → z = 2 (we’re short by 2).
-#If head_count = 15 and target = 14 → z = -1 (we’re above target by 1).
-        z = model.NewIntVar(-total_periods, total_periods, f"headteach_diff_cls{cls_idx}")
-        model.Add(z == target - head_count)
-        #So if we’re under the target, shortfall = positive gap; if we’re above/at target, shortfall = 0.
-        shortfall = model.NewIntVar(0, total_periods, f"headteach_shortfall_cls{cls_idx}")
-        model.AddMaxEquality(shortfall, [z, model.NewConstant(0)])
-       #Add this shortfall (times its weight) to the objective we minimize.
-        penalty_terms.append(headteacher_quota_weight * shortfall)
-        headteacher_shortfall_vars.append(shortfall)
-
-    for (c_idx, d, s, t_idx), a_var in teacher_assigned.items():  # Corrected syntax
-        # Soft: avoid scheduling during a teacher's unavailable time
-        #Loop over every teacher assignment decision variable.
-        #a_var is a 0/1 switch that becomes 1 if we pick teacher t_idx to teach course c_idx at day d, slot s.
-        if (d, s) in teachers[t_idx]["unavailable"]:
-            penalty_terms.append(unavailability_weight * a_var)
-            unavailability_vars.append(a_var)
-        # Soft: prefer specialists for selected subjects (PE, English, Art
-       # If the subject is one of the specialist ones (PE/English/Art), and this teacher doesn’t have that qualification, 
-       # add another penalty (again only counts if a_var = 1).
-        subj = courses[c_idx]["subject"]
-        if subj in specialist_set and subj not in teachers[t_idx]["quals"]:
-            penalty_terms.append(unqualified_weight * a_var)
-            unqualified_vars.append(a_var)
-
-    # Preferences: Quota/shortfall model
-    # For each teacher t: shortfall_t = min(total_assigned_t, quota_cap_t) - preferred_matches_t
-    # where quota_cap_t = min(len(preferred_t), optional_global_quota) if provided.
-    # Penalty applies only to the shortfall; no extra penalty beyond the quota.
-    # No preference quota overrides from input; use per-teacher preferred count
-   
-
-    for t_idx, t in enumerate(teachers):
-        # Total assigned periods for teacher t
-        weekly_max_t = int(t.get("weekly_max", 0))#If it’s missing, use 0 (safe fallback).
-        #Collect all 0/1 decision switches where this teacher could be assigned (across all courses/days/slots).
-        all_assign_vars = [a_var for (c_idx, d, s, tt), a_var in teacher_assigned.items() if tt == t_idx]
-#dirst is the weeklymax and second is the no. of booleans
-        ub = min(weekly_max_t, len(all_assign_vars))
-        assigned_total_t = model.NewIntVar(0, ub, f"assigned_total_t{t_idx}")
-        if all_assign_vars:
-            model.Add(assigned_total_t == sum(all_assign_vars))
-        else:
-            model.Add(assigned_total_t == 0)
-
-
-        # Matches at preferred times
-        preferred_times = list(t.get("preferred", ()))#If they have none, we use () (empty) so nothing breaks.
-        P_t = len(preferred_times)#no. of preferred slots
-# how many of the teacher’s preferred slots we actually used.
-        pref_match_t = model.NewIntVar(0, P_t, f"pref_matches_t{t_idx}")
-        if preferred_times:
-            # Sum of “teacher t teaches at (d,s)” across all preferred slots.
-            # Each bucket sum is 0/1 thanks to AddAtMostOne, so the total is a count.
-            model.Add(
-                pref_match_t ==
-                sum(sum(teacher_time_to_teacher_assigned[(t_idx, d, s)])
-                    for (d, s) in preferred_times)
-            )
-        else:
-            model.Add(pref_match_t == 0)
-        # Quota shortfall: only penalize missed preferred slots up to the quota cap
-        quota_cap = P_t  # preferred slots
-        # q_t = min(assigned_total_t, quota_cap)
-        q_t = model.NewIntVar(0, quota_cap, f"quota_min_t{t_idx}")
-        model.AddMinEquality(q_t, [assigned_total_t, model.NewConstant(quota_cap)])
-        # diff = q_t - pref_match_t (can be negative if we over-match)
-        diff = model.NewIntVar(-quota_cap, quota_cap, f"pref_diff_t{t_idx}")
-        model.Add(diff == q_t - pref_match_t)
-        # shortfall = max(0, diff)
-        shortfall_t = model.NewIntVar(0, quota_cap, f"pref_shortfall_t{t_idx}")
-        model.AddMaxEquality(shortfall_t, [diff, model.NewConstant(0)])
-        # add penalty
-        penalty_terms.append(off_preference_weight * shortfall_t)
-        off_pref_vars.append(shortfall_t)
-
     # Hard constraint: For each class and day, lessons must be in a single
     # continuous block (no gaps where children would be unsupervised).
     class_occ: Dict[Tuple[int, int, int], IntVar] = {}
@@ -410,7 +302,9 @@ def solve_timetabling_problem(
 
             start_vars: List[IntVar] = []#Make an empty list to collect “start-of-block” switches for each slot.
             for s in range(len(slots)):
+               # start = 1 means:“A block of lessons starts at this slot.”
                 start = model.NewBoolVar(f"start_cls{cls_idx}_d{d}_s{s}")
+                #So if the day begins with a lesson → start = 1.
                 if s == 0:
                     model.Add(start == class_occ[(cls_idx, d, 0)])
                 else:
@@ -427,15 +321,77 @@ def solve_timetabling_problem(
 
             # 4) Hard rule: the first slot must be occupied every day
             model.Add(class_occ[(cls_idx, d, 0)] == 1)
-        
-    # Soft constraint: prefer specials as double periods (consecutive pairs)
+
+
+
+
+  # Soft constraints
+
+    penalty_terms: List[PenaltyExpr] = []
+    # Track components for detailed breakdown
+    unavailability_vars: List[IntVar] = []
+    unqualified_vars: List[IntVar] = []
+    # Soft: subject daily cap (per class, per day): penalize excess over 2
+    subject_daily_excess_vars: List[IntVar] = []
+    for cls_idx, cls in enumerate(classes):
+        for d in range(len(days)):
+            # gather all subjects offered for this class
+            subjects_for_class = {c["subject"] for c in courses if c["class_id"] == cls["id"]}
+            for subj in subjects_for_class:
+                #Collect all slots where this subject is scheduled today
+                #ys = [1, 0, 1, 0, 0, 0]
+                ys = [
+                    course_scheduled[(ci, d, s)]
+                    for ci, c in enumerate(courses)
+                    if c["class_id"] == cls["id"] and c["subject"] == subj
+                    for s in slots
+                    if (ci, d, s) in course_scheduled
+                ]
+                if not ys:
+                    continue
+                max_count = len(slots)
+                #Count how many times the subject appears today
+                #total_count = how many 1s are in ys
+                total_count = model.NewIntVar(0, max_count, f"subj_total_cls{cls_idx}_d{d}_{subj}")
+                model.Add(total_count == sum(ys))
+                # excess = max(0, total_count - 2)
+                diff = model.NewIntVar(-max_count, max_count, f"subj_diff_cls{cls_idx}_d{d}_{subj}")
+                model.Add(diff == total_count - 2)
+                excess = model.NewIntVar(0, max_count, f"subj_excess_cls{cls_idx}_d{d}_{subj}")
+                #“Set excess equal to the larger of diff and 0.”
+                model.AddMaxEquality(excess, [diff, model.NewConstant(0)])
+                penalty_terms.append(subject_daily_cap_weight * excess)
+                subject_daily_excess_vars.append(excess)
+
+
+#Go through every possible teacher assignment in the whole model.
+    for (c_idx, d, s, t_idx), a_var in teacher_assigned.items():  # Corrected syntax
+        # Soft: avoid scheduling during a teacher's unavailable time
+        #Loop over every teacher assignment decision variable.
+        #a_var is a 0/1 switch that becomes 1 if we pick teacher t_idx to teach course c_idx at day d, slot s.
+        #Is teacher t_idx unavailable on this day d and slot s
+        if (d, s) in teacher_unavailable_sets[t_idx]:
+            penalty_terms.append(unavailability_weight * a_var)
+            unavailability_vars.append(a_var)
+
+        # Soft: prefer specialists for selected subjects (PE, English, Art
+       # If the subject is one of the specialist ones "Sport", "Englisch", "Kunst", "Musik", and this teacher doesn’t have that qualification, 
+       # add another penalty (again only counts if a_var = 1).
+        subj = courses[c_idx]["subject"]
+        if subj in specialist_set and subj not in teachers[t_idx]["quals"]:
+            penalty_terms.append(unqualified_weight * a_var)
+            unqualified_vars.append(a_var)
+
+
+
+    # Soft constraint: prefer selected subjects as double periods (consecutive pairs)
     #We’ll store a counter per course for “how many single special slots” it ends up with.
     double_period_singles_vars: List[IntVar] = []
-
+#
     for c_idx, course in enumerate(courses):
-        is_special_room = course["room_type"] in special_room_types
-        is_special_subj = course["subject"] in specialist_set
-        if not (is_special_room or is_special_subj):
+        # Only subjects listed in double_subjects participate in this soft rule.
+        is_double_subject = course["subject"] in double_subjects
+        if not is_double_subject:
             continue
 
     # all feasible placements for this course (0/1 vars)
@@ -448,85 +404,86 @@ def solve_timetabling_problem(
         if not times:
             continue
 
-    # build pair vars: pv[d,s] = 1 iff scheduled at (d,s) AND (d,s+1)
-        pair_vars: List[IntVar] = []
+    # build non-overlapping pair selection vars:
+    # z[d,s] can be 1 only if scheduled at (d,s) AND (d,s+1), and pairs cannot overlap
+        pair_select_vars: List[IntVar] = []
         for d in range(len(days)):
+            day_pair_vars: List[IntVar] = []
             for s in range(num_slots_per_day - 1):
                 k1 = (c_idx, d, s)
                 k2 = (c_idx, d, s + 1)
                 if k1 in course_scheduled and k2 in course_scheduled:
                     x = course_scheduled[k1]
                     y = course_scheduled[k2]
-                    pv = model.NewBoolVar(f"pair_c{c_idx}_d{d}_s{s}")
-                    model.AddMultiplicationEquality(pv, [x, y])  # pv = x AND y
-                    pair_vars.append(pv)
+                    z = model.NewBoolVar(f"pairsel_c{c_idx}_d{d}_s{s}")
+                    # z can be 1 only if both slots are scheduled
+                    model.Add(z <= x)
+                    model.Add(z <= y)
+                    day_pair_vars.append(z)
+            # enforce non-overlap of selected pairs within the day
+            if day_pair_vars:
+                for s in range(len(day_pair_vars) - 1):
+                    #If a course is in slots 2–3 and 3–4, you must not count both.
+                    #This forbids selecting overlapping pairs 
+                    model.Add(day_pair_vars[s] + day_pair_vars[s + 1] <= 1)
+                pair_select_vars.extend(day_pair_vars)
 
-    # singles >= total_slots - 2 * (#pairs)
+    # singles == total_slots - 2 * (#non-overlapping selected pairs)
+    #Sport scheduled 5 times,Two double periods → 4 slots used,One slot left alone
         total_slots = sum(times)
-        num_pairs   = sum(pair_vars)
+        num_pairs   = sum(pair_select_vars)
 
         singles = model.NewIntVar(0, len(times), f"singles_c{c_idx}")
-        model.Add(singles >= total_slots - 2 * num_pairs)
+        model.Add(singles == total_slots - 2 * num_pairs)
 
         penalty_terms.append(double_period_weight * singles)
         double_period_singles_vars.append(singles)
 
-    # Soft constraint: penalize days where a class has Math, English, and
-    # Science all scheduled on the same day (discourage clustering)
-        subj_names = difficult_subjects
-        #We’ll store a 0/1 variable per (class, day) that becomes 1 if all 3 heavy subjects appear that day.
-        triple_difficult_vars: List[IntVar] = []
+    # Soft constraint: penalize when the combined count across all listed difficult
+    # subjects exceeds 'difficult_threshold' in a single day for a class.
+    subj_names = difficult_subjects
+    triple_difficult_vars: List[IntVar] = []
+    if subj_names:
         for cls_idx, cls in enumerate(classes):
             for d in range(len(days)):
-                present_vars: Dict[str, IntVar] = {}
-                for subj in subj_names:
-                    ys = [
-                        course_scheduled[(c_idx, d, s)]
-                        for c_idx, course in enumerate(courses)
-                        if (
-                            course["class_id"] == cls["id"] and
-                            course["subject"] == subj
-                        )
-                        for s in slots
-                        if (c_idx, d, s) in course_scheduled
-                    ]
-                    pv = model.NewBoolVar(f"present_cls{cls_idx}_d{d}_{subj}")
-                    if ys:
-                        for v in ys:
-                            model.Add(pv >= v)
-                        model.Add(pv <= sum(ys))
-                    else:
-                        model.Add(pv == 0)
-                    present_vars[subj] = pv
-
-                if len(subj_names) >= 2:
-                    # Generalize: penalize when ALL listed difficult subjects occur on the same day
-                    triple = model.NewBoolVar(f"difficult_combo_cls{cls_idx}_d{d}")
-                    # triple <= each present var
-                    for subj in subj_names:
-                        model.Add(triple <= present_vars[subj])
-                    # triple >= sum(present) - (k-1)
-                    k = len(subj_names)
-                    model.Add(triple >= sum(present_vars[s] for s in subj_names) - (k - 1))
-                    penalty_terms.append(triple_difficult_weight * triple)
-                    triple_difficult_vars.append(triple)
+                #ys = [1, 0, 1, 1, 0, 0]
+                #“Is a difficult subject scheduled here for this class on this day?
+                ys = [
+                    course_scheduled[(ci, d, s)]
+                    for ci, course in enumerate(courses)
+                    if course["class_id"] == cls["id"] and course["subject"] in subj_names
+                    for s in slots
+                    if (ci, d, s) in course_scheduled
+                ]
+                max_count = len(slots)
+                #total_count = how many 1s are in ys
+                total_count = model.NewIntVar(0, max_count, f"diff_total_count_cls{cls_idx}_d{d}")
+                if ys:
+                    model.Add(total_count == sum(ys))
+                else:
+                    model.Add(total_count == 0)
+                # excess = max(0, total_count - threshold) counts how many over the limit
+                thr = max(0, difficult_threshold)
+                diff = model.NewIntVar(-max_count, max_count, f"diff_minus_thr_cls{cls_idx}_d{d}")
+                model.Add(diff == total_count - thr)
+                #Keep only the part that exceeds the limit
+                excess = model.NewIntVar(0, max_count, f"diff_excess_cls{cls_idx}_d{d}")
+                model.AddMaxEquality(excess, [diff, model.NewConstant(0)])
+                penalty_terms.append(triple_difficult_weight * excess)
+                triple_difficult_vars.append(excess)
 
     if penalty_terms:
         model.Minimize(sum(penalty_terms))
 #OR-Tools solver object that will actually search for a solution.
     solver = cp_model.CpSolver()
     solver.parameters.max_time_in_seconds = time_limit_seconds
-    #1 worker repeatable (deterministic) but slower.
-    #More workers = faster, but results can change (even with same seed).
+
+    # Thesis configuration: single-threaded search .
+    solver.parameters.num_search_workers = 1
+    solver.parameters.search_branching = cp_model.AUTOMATIC_SEARCH
     if random_seed is not None:
         solver.parameters.random_seed = random_seed
-        solver.parameters.num_search_workers = 1
-    # Use provided workers or default to available CPUs (at least 1)
-    elif num_search_workers is None:
-        cpu_count = os.cpu_count() or 1
-        solver.parameters.num_search_workers = max(1, cpu_count)#min 1 worker or thread
-    else:
-        solver.parameters.num_search_workers = max(1, num_search_workers)
+
         #status tells you how it went: e.g. OPTIMAL, FEASIBLE, INFEASIBLE, or UNKNOWN (time ran out with nothing)
     status = solver.Solve(model)
 
@@ -555,20 +512,13 @@ def solve_timetabling_problem(
 
     # Compute detailed penalty breakdown
     #
-    off_pref_count = float(sum(solver.Value(v) for v in off_pref_vars))
     unavailability_count = float(sum(solver.Value(v) for v in unavailability_vars))
     unqualified_count = float(sum(solver.Value(v) for v in unqualified_vars))
     double_period_single_slots = float(sum(solver.Value(v) for v in double_period_singles_vars))
     triple_difficult_count = float(sum(solver.Value(v) for v in triple_difficult_vars))
-    headteacher_shortfall_count = float(sum(solver.Value(v) for v in headteacher_shortfall_vars))
+    subject_daily_excess_count = float(sum(solver.Value(v) for v in subject_daily_excess_vars))
 
     solution["penalties"] = {
-        "preference_shortfall": {
-            "weight": float(off_preference_weight),
-            "count": off_pref_count,  # sum over teachers of (quota cap
-            # - matched preferred assignments)
-            "weighted": float(off_preference_weight) * off_pref_count,
-        },
         "unavailability": {
             "weight": float(unavailability_weight),
             "count": unavailability_count,
@@ -589,10 +539,10 @@ def solve_timetabling_problem(
             "count": triple_difficult_count,
             "weighted": float(triple_difficult_weight) * triple_difficult_count,
         },
-        "headteacher_quota": {
-            "weight": float(headteacher_quota_weight),
-            "count": headteacher_shortfall_count,
-            "weighted": float(headteacher_quota_weight) * headteacher_shortfall_count,
+        "subject_daily_cap": {
+            "weight": float(subject_daily_cap_weight),
+            "count": subject_daily_excess_count,
+            "weighted": float(subject_daily_cap_weight) * subject_daily_excess_count,
         },
         "total_weighted": {
             "weight": 1.0,

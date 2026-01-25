@@ -1,0 +1,48 @@
+{
+  "days": ["Mo", "Di", "Mi", "Do", "Fr"],
+  "num_slots_per_day": 6,
+  "per_day_max": { "Fr": 5 },
+
+  "specialist_subjects": ["Sport", "Englisch", "Kunst", "Musik"],
+  "double_subjects": ["Sport", "Kunst", "Musik"],
+  "difficult_day_subjects": ["Mathe", "Deutsch", "Englisch"],
+
+  "classes": [
+    { "id": "3a", "daily_min": 4, "daily_max": 6 },
+    { "id": "3b", "daily_min": 4, "daily_max": 6 }
+  ],
+
+  "teachers": [
+    { "id": "T_DE",     "weekly_max": 26, "quals": ["Deutsch"], "unavailable": [[1, 3], [4, 2]] },
+    { "id": "T_MA_SU",  "weekly_max": 24, "quals": ["Mathe", "Sachunterricht"], "unavailable": [[2, 1], [3, 5]] },
+    { "id": "T_EN",     "weekly_max": 22, "quals": ["Englisch"], "unavailable": [[0, 4]] },
+    { "id": "T_SP",     "weekly_max": 20, "quals": ["Sport"], "unavailable": [[2, 4]] },
+    { "id": "T_KU_MU",  "weekly_max": 20, "quals": ["Kunst", "Musik"], "unavailable": [[1, 2]] }
+  ],
+
+  "rooms": [
+    { "id": "R101", "type": "GEN" },
+    { "id": "R102", "type": "GEN" },
+    { "id": "Turnhalle", "type": "GYM" },
+    { "id": "Kunstraum1", "type": "ART" },
+    { "id": "Musikraum1", "type": "MUS" }
+  ],
+
+  "courses": [
+    { "class_id": "3a", "subject": "Deutsch",        "periods": 8, "room_type": "GEN" },
+    { "class_id": "3a", "subject": "Mathe",          "periods": 5, "room_type": "GEN" },
+    { "class_id": "3a", "subject": "Sachunterricht", "periods": 3, "room_type": "GEN" },
+    { "class_id": "3a", "subject": "Englisch",       "periods": 2, "room_type": "GEN" },
+    { "class_id": "3a", "subject": "Sport",          "periods": 3, "room_type": "GYM" },
+    { "class_id": "3a", "subject": "Kunst",          "periods": 2, "room_type": "ART" },
+    { "class_id": "3a", "subject": "Musik",          "periods": 2, "room_type": "MUS" },
+
+    { "class_id": "3b", "subject": "Deutsch",        "periods": 8, "room_type": "GEN" },
+    { "class_id": "3b", "subject": "Mathe",          "periods": 5, "room_type": "GEN" },
+    { "class_id": "3b", "subject": "Sachunterricht", "periods": 3, "room_type": "GEN" },
+    { "class_id": "3b", "subject": "Englisch",       "periods": 2, "room_type": "GEN" },
+    { "class_id": "3b", "subject": "Sport",          "periods": 3, "room_type": "GYM" },
+    { "class_id": "3b", "subject": "Kunst",          "periods": 2, "room_type": "ART" },
+    { "class_id": "3b", "subject": "Musik",          "periods": 2, "room_type": "MUS" }
+  ]
+}
