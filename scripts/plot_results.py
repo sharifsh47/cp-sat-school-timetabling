@@ -61,15 +61,24 @@ plt.tight_layout()
 # PLOT 2 — Runtime across seeds (small instance)
 # ============================================================
 plt.figure(figsize=(7, 4))
-small = df[df["instance"] == "small"]
 
-plt.scatter(small["seed"], small["wall_time_s"], alpha=0.7)
+runtime_subset = df[df["instance"].isin(["small", "medium"])]
+
+for inst in ["small", "medium"]:
+    sub = runtime_subset[runtime_subset["instance"] == inst]
+    plt.scatter(
+        sub["seed"],
+        sub["wall_time_s"],
+        label=inst,
+        alpha=0.7
+    )
+
 plt.xlabel("Random seed")
 plt.ylabel("Wall time (s)")
-plt.title("Runtime across seeds (small instance)")
+plt.title("Runtime across seeds (small and medium instances)")
+plt.legend()
 plt.grid(True)
 plt.tight_layout()
-
 # ============================================================
 # PLOT 3 — Mean penalty per period by instance size
 # ============================================================
